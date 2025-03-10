@@ -329,6 +329,7 @@ getLMmodel <- function(exprData,
 #' @param force if force=T, all the ratios of appearance with at least one gene will lead to the corresponding final linear regression model.
 #' If force=F, only the ratios of appearance with at least 5 genes will lead to the corresponding final models. to create the final models.
 #' @param save if save=T, results will be saved in the path indicated.
+#' @param gene2GO custom gene2GO list.  If provided, library topGO will be used, otherwise gprofiler2
 #' @return a list containing 1) LASSO models, one for each run; 2) Linear regression models, one for each ratio of appearance selected.
 #' @export
 #' @examples
@@ -344,7 +345,8 @@ getHubGenes <- function(exprData,
                         tissueName="tissue1",
                         targetName="target1",
                         force=F,
-                        save=T) {
+                        save=T,
+                        gene2GO=NULL) {
 
   # Create directory if necessary
   if(!dir.exists(paste0(path, "/hubGenes/"))) {
@@ -370,7 +372,7 @@ getHubGenes <- function(exprData,
     result <- list()
 
     # Get hub genes enrichment for each cutoff
-    sumLogPval <- getGeneSetEnrichment(lasso_models=models_lasso)
+    sumLogPval <- getGeneSetEnrichment(lasso_models=models_lasso, gene2GO = gene2GO)
     enrichment <- sumLogPval$enrich
     sumLogPval <- sumLogPval$sumLogPval
 
@@ -429,21 +431,44 @@ getHubGenes <- function(exprData,
 }
 
 
+#' gettopGO - Function to get GO enrichment using the topGO package.
+#' @param gene.list a list of genes in a module
+#' @param gene2GO custom gene2GO list.
+#' @param ontology the GO ontology to use
+#' @return a data frame with enrichment stats
+
+# TODO: use additional ontologies?
+gettopGO <- function(gene.list, gene2GO, ontology = "BP") {
+  geneInSet <- as.factor(as.numeric(names(gene2GO) %in% gene.list))
+  if (nlevels(geneInSet) < 2 ) return(NA)
+  names(geneInSet) <- names(gene2GO)
+  topGOdata <- new("topGOdata", ontology = ontology, description = "", allGenes = geneInSet, annot = annFUN.gene2GO, gene2GO = gene2GO)
+  topGOresults <- runTest(topGOdata, algorithm = "weight01", statistic = "fisher")
+  result <- GenTable(topGOdata, topGOresults, topNodes = sum(topGOresults@score < 0.05))
+  result <- dplyr::rename_with(result, \(x) str_replace(x, "result1|apply.*", "p_value"))
+  result$p_value <- as.numeric(result$p_value)
+  result$source <- ontology
+  result
+}
+
 
 #' getGeneSetEnrichment - It applies a functional enrichment analysis for a gene set from both LASSO models or networks.
 #' @param lasso_models a list of LASSO models
 #' @param net a data frame containing the structure of the network (hub gene, gene and correlation columns)
 #' @param sources a vector with the names of the sources to be tested
 #' @param hubs if the net parameter is not null and hubs=T, the enrichment of the hub genes will also be tested
+#' @param gene2GO custom gene2GO list.  If provided, library topGO will be used, otherwise gprofiler2
 #' @return a list containing 1) the annotations obtained for each query; 2) the summary of the enrichment for each query
 #' @export
 #' @examples
 
 getGeneSetEnrichment <- function(lasso_models=NULL, net=NULL,
-                                 sources = c("GO", "KEGG", "REAC", "HP"), hubs=T) {
+                                 sources = c("GO", "KEGG", "REAC", "HP"), hubs=T,
+                                 gene2GO = NA) {
 
   # Load libraries
   require(gprofiler2)
+  require(topGO)
   all.genes <- list()
 
   if(!is.null(lasso_models)) { # Get the enrichment of the hub genes per cutoff
@@ -451,13 +476,14 @@ getGeneSetEnrichment <- function(lasso_models=NULL, net=NULL,
     hubGenes <- table(unlist(lapply(lasso_models, function(x) x$coeffs$genes)))
     hubGenesPerCutoff <- sapply(seq(1,length(lasso_models),1), function(x) names(hubGenes)[hubGenes>=x])
     names(hubGenesPerCutoff) <- paste0("cutoff", 1:length(lasso_models))
-    all.genes <- hubGenesPerCutoff
+    all.genes <- hubGenesPerCutoff[sapply(hubGenesPerCutoff, length) > 0] # don't try to calc enrichment for empty list
 
   } else if(!is.null(net)) { # Get the enrichment for each module of the CS-GCN
 
     if(!is.null(net$hubGene)) {
       for(hub in unique(net$hubGene)) {
-        all.genes[[hub]] <- gsub("\\..*", "", net$genes[net$hubGene==hub])
+       # all.genes[[hub]] <- gsub("\\..*", "", net$genes[net$hubGene==hub])
+        all.genes[[hub]] <-  net$genes[net$hubGene==hub]
       }
       if(hubs==T) {
         all.genes[["hubs"]] <- unique(net$hubGene)
@@ -466,7 +492,9 @@ getGeneSetEnrichment <- function(lasso_models=NULL, net=NULL,
     } else { # Get the enrichment for each wgcna module
 
       for(hub in unique(as.vector(net$moduleColors))) {
-        all.genes[[hub]] <- gsub("\\..*", "", names(net$moduleColors)[net$moduleColors==hub])
+       # all.genes[[hub]] <- gsub("\\..*", "", names(net$moduleColors)[net$moduleColors==hub])
+        all.genes[[hub]] <-  names(net$moduleColors)[net$moduleColors==hub]
+
       }
       if(hubs==T) {
         all.genes[["hubs"]] <- unique(as.vector(net$moduleColors))
@@ -475,11 +503,15 @@ getGeneSetEnrichment <- function(lasso_models=NULL, net=NULL,
   }
 
   # Get enrichment
-  enrich <- gprofiler2::gost(all.genes,
-                             correction_method="g_SCS",
-                             sources=sources,
-                             organism = "hsapiens",
-                             exclude_iea = T)$result
+  if(is.null(gene2GO)) { #no gene2GO list, use gprofiler
+    enrich <- gprofiler2::gost(all.genes,
+                               correction_method="g_SCS",
+                               sources=sources,
+                               organism = "hsapiens",
+                               exclude_iea = T)$result
+  } else { #use topGO
+    enrich <- bind_rows(lapply(all.genes, gettopGO, gene2GO=gene2GO.list ), .id = "query")
+    }
 
   if(!is.null(enrich)) {
     enrich <- enrich[order(enrich$query, enrich$p_value, decreasing=F), ]
@@ -540,6 +572,7 @@ getCorrelations <- function(exprData,
 #' @param minCor the minimum correlation of a gene to be added to a module
 #' @param maxTol the maximum number of tries to get a better enrichment without getting it
 #' @param approach the approach to complete the modules (fixed, coefficient or enrichment)
+#' @param gene2GO custom gene2GO list.  If provided, library topGO will be used, otherwise gprofiler2
 #' @return a list containing 1) the network; 2) the plot of the correlation distribution for each module created.
 #' If approach="enrichment", it also includes 3) the statistics of the process of creating the modules; 4) the plot of the statistics.
 #' @export
@@ -552,7 +585,8 @@ getModules <- function(hubs,
                        m=10,
                        minCor=0.3,
                        maxTol=3,
-                       approach=c("fixed", "coefficient", "enrichment")) {
+                       approach=c("fixed", "coefficient", "enrichment"),
+                       gene2GO=NULL) {
 
   # Load library
   require(psych)
@@ -653,7 +687,7 @@ getModules <- function(hubs,
           mynet$moduleColors <- rep(h, length(G))
           names(mynet$moduleColors) <- G
 
-          E <- getGeneSetEnrichment(net=mynet, hubs=F)$sumLogPval # E(G)
+          E <- getGeneSetEnrichment(net=mynet, hubs=F, gene2GO = gene2GO)$sumLogPval # E(G)
 
           if(is.null(E)) { # if we found no enrichment, add this row to the table
             E <- data.frame(query=h, sum=0, numGenes=size, sum_corrected=0)
@@ -782,6 +816,8 @@ saveResults <- function(tissueName, targetName, hubGenes, path) {
 #' @param cutoff the name of the cutoff of this TGCN
 #' @param tissueName the name of the tissue, cohort or dataset
 #' @param targetName the name of the target
+#' @param gene2GO custom gene2GO list.  If provided, library topGO will be used, otherwise gprofiler2
+#' @param cellTypeAnnotation Should the cell type annotation be run?  Set to FALSE if you don't have cell type info
 #' @return a list containing 1) the net, the eigengenes and the plot of the correlation per module; 2) the GO enrichment annotations and statistics; 3) the cell-type markers enrichment analysis results;
 #' 4) the module-trait association analysis results; 5) the crossTabPlot analysis resylts between the modules of the TGCN.
 #' @export
@@ -796,7 +832,9 @@ getModulesAnnotation <- function(net,
                                  cutoff,
                                  tissueName,
                                  targetName,
-                                 reduced=F) {
+                                 reduced=F,
+                                 gene2GO=NULL,
+                                 cellTypeAnnotation=T) {
 
   # TGCN already characterized?
   if(!dir.exists(paste0(path, "/results/"))) {
@@ -812,7 +850,7 @@ getModulesAnnotation <- function(net,
 
   # Get the enrichment per module
   mynet <- net$net
-  enrich <- getGeneSetEnrichment(net=mynet)
+  enrich <- getGeneSetEnrichment(net=mynet, gene2GO = gene2GO)
   sumLogPval <- enrich$sumLogPval
   sumLogPval$name <- rep(cutoff, nrow(sumLogPval))
 
@@ -859,7 +897,11 @@ getModulesAnnotation <- function(net,
   }
 
   # Get CT enrichment
-  ct_enrich <- getCTenrich(mynet)
+  if(cellTypeAnnotation) {
+    ct_enrich <- getCTenrich(mynet)
+  } else {
+    ct_enrich <- NULL
+  }
 
   if(!is.null(ct_enrich) & save==T) {
     png(filename=paste0(path, "/results/", targetName, "_", tissueName, "_", cutoff, "_TGCN_CTenrich.png"), width=12, height=12, unit="cm", res=500)
@@ -876,7 +918,7 @@ getModulesAnnotation <- function(net,
     write.csv(mynet, paste0(path, "/results/", targetName, "_", tissueName, "_", cutoff, "_TGCN.csv"), row.names=F)
     write.csv(terms, paste0(path, "/results/", targetName, "_", tissueName, "_", cutoff, "_TGCN_GOenrich.csv"), row.names=F)
     write.csv(enrich$sumLogPval, paste0(path, "/results/", targetName, "_", tissueName, "_", cutoff, "_TGCN_GOenrich_stats.csv"), row.names=F)
-    write.csv(ct_enrich$df, paste0(path, "/results/", targetName, "_", tissueName, "_", cutoff, "_TGCN_CTenrich.csv"))
+    if(!is.null(ct_enrich)) write.csv(ct_enrich$df, paste0(path, "/results/", targetName, "_", tissueName, "_", cutoff, "_TGCN_CTenrich.csv"))
   }
 
   # CrossTabPlot
@@ -940,10 +982,12 @@ getModulesAnnotation <- function(net,
 #' @param minCor the minimum correlation of a gene to be added to a module
 #' @param maxTol the maximum number of tries to get a better enrichment without getting it
 #' @param approach the approach to complete the modules (fixed, coefficient or enrichment)
+#' @param gene2GO custom gene2GO list.  If provided, library topGO will be used, otherwise gprofiler2
 #' @param seed the seed number to ensure the reproducibility of the results
 #' @param save if save=T, the results of the analysis will be saved in separate files
 #' @param overwrite if overwrite=T, the analysis will be repeated and files will be overwritten
 #' @param path the path where results are stored
+#' @param cellTypeAnnotation Should the cell type annotation be run?  Set to FALSE if you don't have cell type info
 #' @return
 #' @export
 #' @examples
@@ -963,12 +1007,14 @@ testAllCutoffs <- function(exprData,
                            minCor=0.3,
                            maxTol=3,
                            approach=c("fixed", "coefficient", "enrichment"),
+                           gene2GO=NULL,
                            seed=1234,
                            save=T,
                            overwrite=T,
                            path=getwd(),
                            reduced=F,
-                           report=F) {
+                           report=F,
+                           cellTypeAnnotation=TRUE) {
 
   # Load libraries
   require(WGCNA)
@@ -984,6 +1030,7 @@ testAllCutoffs <- function(exprData,
   require(gprofiler2)
   require(psych)
   require(rrvgo)
+  require(topGO)
 
   # Hub genes already tested?
   if(!dir.exists(paste0(path, "/hubGenes/"))) {
@@ -1010,7 +1057,8 @@ testAllCutoffs <- function(exprData,
                             seed=seed,
                             cutoffs=cutoffs,
                             save=F,
-                            force=T)
+                            force=T,
+                            gene2GO = gene2GO)
 
     if(save==T) {
       saveRDS(hubGenes, paste0(path, "/hubGenes/", targetName, "_", tissueName, "_hubGenes.rds"))
@@ -1056,7 +1104,8 @@ testAllCutoffs <- function(exprData,
                          m=m,
                          minCor=minCor,
                          maxTol=maxTol,
-                         approach=approach)
+                         approach=approach,
+                         gene2GO=gene2GO)
 
       cat("\n Step 3.2: TGCN characterization for cutoff", cutoff, "\n")
       net2 <- getModulesAnnotation(net=net1,
@@ -1068,7 +1117,9 @@ testAllCutoffs <- function(exprData,
                                    cutoff=paste0("c", cutoff),
                                    tissueName=tissueName,
                                    targetName=targetName,
-                                   reduced=reduced)
+                                   reduced=reduced,
+                                   gene2GO=gene2GO,
+                                   cellTypeAnnotation=cellTypeAnnotation)
 
       results[["nets"]][[paste0("c", cutoff)]] <- net2
 

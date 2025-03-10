@@ -139,8 +139,8 @@ plotModulesOverlap <- function(name1="TGCN1",
   # Load library
   require(WGCNA)
 
-  background1 <- gsub("\\..*", "", background1)
-  background2 <- gsub("\\..*", "", background2)
+ # background1 <- gsub("\\..*", "", background1)
+#  background2 <- gsub("\\..*", "", background2)
 
   # If we only have one TGCN
   if(is.null(tgcn2)) {
