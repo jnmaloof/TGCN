@@ -271,7 +271,8 @@ getLMmodel <- function(exprData,
                              summaryFunction = defaultSummary)
 
   # train the model
-  model <- train(x=data.train,
+  ## I don't understand why, but now (Sept. 2026) I have to specify which train function to use
+  model <- caret::train(x=data.train,
                  y=target.train,
                  trControl = fitControl,
                  metric = metric,
